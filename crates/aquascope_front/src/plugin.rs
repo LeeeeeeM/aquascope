@@ -1,16 +1,15 @@
 use std::{
   borrow::Cow,
   env,
-  process::{exit, Command},
+  process::{Command, exit},
   time::Instant,
 };
 
 use aquascope::{
   analysis::{
-    self,
+    self, AnalysisOutput, AquascopeError, AquascopeResult,
     permissions::ENABLE_FLOW_PERMISSIONS,
-    stepper::{PermIncludeMode, INCLUDE_MODE},
-    AquascopeError, AquascopeResult,
+    stepper::{INCLUDE_MODE, PermIncludeMode},
   },
   errors::{
     initialize_error_tracking, silent::silent_session, track_body_diagnostics,
@@ -18,7 +17,6 @@ use aquascope::{
 };
 use clap::{Parser, Subcommand};
 use fluid_let::fluid_set;
-use rustc_hir::BodyId;
 use rustc_interface::interface::Result as RustcResult;
 use rustc_middle::ty::TyCtxt;
 use rustc_plugin::{CrateFilter, RustcPlugin, RustcPluginArgs, Utf8Path};
@@ -119,7 +117,6 @@ impl RustcPlugin for AquascopePlugin {
         let steps_include_mode =
           steps_include_mode.unwrap_or(PermIncludeMode::Changes);
         let mut callbacks = AquascopeCallbacks {
-          analysis: Some(permissions_analyze_body),
           output: Vec::default(),
           should_fail: plugin_args.should_fail,
           steps_include_mode,
@@ -130,7 +127,7 @@ impl RustcPlugin for AquascopePlugin {
         let _ = run_with_callbacks(&compiler_args, &mut callbacks);
         postprocess(callbacks.output)
       }
-      Interpreter { .. } => {
+      Interpreter => {
         let mut callbacks = aquascope::interpreter::InterpretCallbacks::new(
           plugin_args.should_fail,
         );
@@ -145,13 +142,6 @@ impl RustcPlugin for AquascopePlugin {
       _ => unreachable!(),
     }
   }
-}
-
-fn permissions_analyze_body(
-  tcx: TyCtxt,
-  id: BodyId,
-) -> AquascopeResult<analysis::AnalysisOutput> {
-  analysis::AquascopeAnalysis::run(tcx, id)
 }
 
 fn postprocess<T: Serialize>(result: T) -> RustcResult<()> {
@@ -172,53 +162,22 @@ pub fn run_with_callbacks(
 
   log::debug!("Running command with callbacks: {args:?}");
 
-  let compiler = rustc_driver::RunCompiler::new(&args, callbacks);
-
-  log::debug!("building compiler ...");
-
   rustc_driver::catch_fatal_errors(move || {
-    compiler.run();
+    rustc_driver::run_compiler(&args, callbacks)
   })
   .map_err(|_| AquascopeError::BuildError { range: None })
 }
 
-pub trait AquascopeAnalysis: Sized + Send + Sync {
-  type Output: Serialize + Send + Sync;
-  fn analyze(
-    &mut self,
-    tcx: TyCtxt,
-    id: BodyId,
-  ) -> AquascopeResult<Self::Output>;
-}
-
-impl<F, O> AquascopeAnalysis for F
-where
-  F: for<'tcx> Fn<(TyCtxt<'tcx>, BodyId), Output = AquascopeResult<O>>
-    + Send
-    + Sync,
-  O: Serialize + Send + Sync,
-{
-  type Output = O;
-  fn analyze(
-    &mut self,
-    tcx: TyCtxt,
-    id: BodyId,
-  ) -> AquascopeResult<Self::Output> {
-    (self)(tcx, id)
-  }
-}
-
 #[allow(dead_code)]
-struct AquascopeCallbacks<A: AquascopeAnalysis> {
-  analysis: Option<A>,
-  output: Vec<AquascopeResult<A::Output>>,
+struct AquascopeCallbacks {
+  output: Vec<AquascopeResult<AnalysisOutput>>,
   should_fail: bool,
   steps_include_mode: PermIncludeMode,
   show_flows: bool,
   rustc_start: Instant,
 }
 
-impl<A: AquascopeAnalysis> rustc_driver::Callbacks for AquascopeCallbacks<A> {
+impl rustc_driver::Callbacks for AquascopeCallbacks {
   fn config(&mut self, config: &mut rustc_interface::Config) {
     config.psess_created = Some(silent_session());
     config.override_queries = Some(borrowck_facts::override_queries);
@@ -238,12 +197,15 @@ impl<A: AquascopeAnalysis> rustc_driver::Callbacks for AquascopeCallbacks<A> {
 
     let _start = Instant::now();
 
-    let mut analysis = self.analysis.take().unwrap();
     find_bodies(tcx).into_iter().for_each(|(_, body_id)| {
       // Track diagnostics for the analysis of the current body
-      let def_id = tcx.hir().body_owner_def_id(body_id);
+      let def_id = tcx.hir_body_owner_def_id(body_id);
       track_body_diagnostics(def_id);
-      self.output.push(analysis.analyze(tcx, body_id));
+      self.output.push(analysis::AquascopeAnalysis::run(
+        tcx,
+        body_id,
+        self.should_fail,
+      ));
     });
 
     log::debug!("Callback analysis took {:?}", self.rustc_start.elapsed());

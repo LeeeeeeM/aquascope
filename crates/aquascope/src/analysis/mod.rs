@@ -14,8 +14,8 @@ use std::{
   ops::{Add, Deref, DerefMut},
 };
 
-pub use boundaries::compute_permission_boundaries;
 use boundaries::PermissionsBoundary;
+pub use boundaries::compute_permission_boundaries;
 pub use find_bindings::find_bindings;
 use ir_mapper::{GatherMode, IRMapper};
 use permissions::{
@@ -27,13 +27,13 @@ use rustc_hir::BodyId;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{self, Span};
 use rustc_utils::{
+  BodyExt, SpanExt,
   mir::borrowck_facts,
   source_map::range::{CharPos, CharRange},
-  BodyExt, SpanExt,
 };
 use serde::Serialize;
-pub use stepper::compute_permission_steps;
 use stepper::PermissionsLineDisplay;
+pub use stepper::compute_permission_steps;
 use ts_rs::TS;
 
 thread_local! {
@@ -268,10 +268,7 @@ pub fn compute_permissions<'tcx>(
 ) -> PermissionsCtxt<'tcx> {
   BODY_ID_STACK.with(|stack| {
     stack.borrow_mut().push(body_id);
-
-    let permissions = permissions::compute(tcx, body_id, body_with_facts);
-
-    permissions
+    permissions::compute(tcx, body_id, body_with_facts)
   })
 }
 
@@ -313,7 +310,7 @@ pub struct AnalysisOutput {
 
 impl<'tcx> AquascopeAnalysis<'tcx> {
   pub fn new(tcx: TyCtxt<'tcx>, body_id: BodyId) -> Self {
-    let def_id = tcx.hir().body_owner_def_id(body_id);
+    let def_id = tcx.hir_body_owner_def_id(body_id);
     let bwf = borrowck_facts::get_body_with_borrowck_facts(tcx, def_id);
     let permissions = compute_permissions(tcx, body_id, bwf);
     let body = &permissions.body_with_facts.body;
@@ -328,11 +325,12 @@ impl<'tcx> AquascopeAnalysis<'tcx> {
   pub fn run(
     tcx: TyCtxt<'tcx>,
     body_id: BodyId,
+    should_fail: bool,
   ) -> AquascopeResult<AnalysisOutput> {
     let analysis_ctxt = Self::new(tcx, body_id);
     let body = &analysis_ctxt.permissions.body_with_facts.body;
 
-    if body.tainted_by_errors.is_some() {
+    if body.tainted_by_errors.is_some() && !should_fail {
       let span = body.span;
       let source_map = tcx.sess.source_map();
       let range = CharRange::from_span(span, source_map).unwrap().into();
@@ -379,8 +377,8 @@ impl<'tcx> AquascopeAnalysis<'tcx> {
     let loan_regions = &self.permissions.loan_regions.as_ref().unwrap();
 
     let loans_to_spans = loan_regions
-      .iter()
-      .filter_map(|(loan, _)| {
+      .keys()
+      .filter_map(|loan| {
         // TODO: using `reserve_location` is not exactly accurate because this
         // could be a two-phase borrow. This needs to use the `activation_location`.
         let loan_loc = self.permissions.borrow_set[*loan].reserve_location();
@@ -571,7 +569,7 @@ impl<'tcx> AquascopeAnalysis<'tcx> {
     // is included in the returned ranges.
     let spans = spans
       .into_iter()
-      .filter(|span| (min_span.lo() <= span.lo() && span.hi() <= max_span.hi()))
+      .filter(|span| min_span.lo() <= span.lo() && span.hi() <= max_span.hi())
       .map(|span| {
         span
           .as_local(self.permissions.body_with_facts.body.span)
@@ -587,7 +585,6 @@ impl<'tcx> AquascopeAnalysis<'tcx> {
     &self,
     points: impl IntoIterator<Item = Point>,
   ) -> Vec<Span> {
-    let hir = self.permissions.tcx.hir();
     let body = &self.permissions.body_with_facts.body;
     let mut spans = Vec::default();
 
@@ -602,7 +599,7 @@ impl<'tcx> AquascopeAnalysis<'tcx> {
         };
       }
       let hir_id = body.location_to_hir_id(loc);
-      let span = hir.span(hir_id);
+      let span = self.permissions.tcx.hir_span(hir_id);
       insert_if_valid!(span);
     });
 
